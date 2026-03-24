@@ -1,0 +1,76 @@
+# ── Virtual Environment ───────────────────────────────────────────────────────
+env/
+venv/
+.venv/
+ENV/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Model Checkpoints & Weights ───────────────────────────────────────────────
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+SDFVD/
+data/
+datasets/
+extracted_frames/
+
+# ── Reports & Private Documents ───────────────────────────────────────────────
+*.docx
+*.pdf
+*.txt
+Final_Report_*.txt
+Project Synopsis*.docx
+
+# ── Presentation Slides ───────────────────────────────────────────────────────
+*.pptx
+*.ppt
+
+# ── Training Outputs ─────────────────────────────────────────────────────────
+*.png
+*.jpg
+*.jpeg
+*.gif
+sequential_training_history.png
+parallel_training_history.png
+sequential_results.png
+parallel_results.png
+
+# ── Jupyter Notebooks ────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+logs/
+runs/
+*.log
+tensorboard/
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Distribution / Build ─────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# ── Hugging Face / Torch Hub cache ───────────────────────────────────────────
+.cache/
+hub/
