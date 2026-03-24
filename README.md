@@ -196,4 +196,4 @@ FakeShield provides several visualisation tools:
 
 ## License
 
-For research and educational purposes only. Use responsibly.
+This project is released under the [MIT License](LICENSE) — free to use, modify, and distribute.
