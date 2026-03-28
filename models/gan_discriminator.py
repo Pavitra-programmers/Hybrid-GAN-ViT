@@ -67,6 +67,20 @@ class GANDiscriminator(nn.Module):
 
         return features, classification
 
+    def freeze_backbone(self):
+        """Freeze EfficientNet backbone — only train projection/classifier heads."""
+        for param in self.backbone_features.parameters():
+            param.requires_grad = False
+        for param in self.backbone_pool.parameters():
+            param.requires_grad = False
+
+    def unfreeze_top_blocks(self, num_blocks: int = 2):
+        """Unfreeze the last num_blocks feature blocks for fine-tuning phase 2."""
+        blocks = list(self.backbone_features.children())
+        for block in blocks[-num_blocks:]:
+            for param in block.parameters():
+                param.requires_grad = True
+
     def get_attention_map(self, x):
         """
         Generate attention map highlighting suspicious regions using

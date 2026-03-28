@@ -211,70 +211,84 @@ def get_transforms(img_size=224, is_training=True):
     
     return transform
 
-def create_dataloaders(data_dir, batch_size=32, img_size=224, num_workers=4, train_split=0.8, frames_per_video=10):
+def get_class_weights(dataset):
+    """
+    Compute per-sample weights for WeightedRandomSampler so every batch is
+    balanced regardless of class imbalance in the dataset.
+    """
+    labels = [label for _, label in dataset.samples]
+    counts = {0: labels.count(0), 1: labels.count(1)}
+    total  = len(labels)
+    # weight for each class = total / (num_classes * count_of_class)
+    class_weight = {cls: total / (2.0 * cnt) if cnt > 0 else 1.0
+                    for cls, cnt in counts.items()}
+    sample_weights = [class_weight[int(lbl)] for lbl in labels]
+    print(f"  Class balance — Real: {counts[0]}, Fake: {counts[1]}  "
+          f"(weights  Real={class_weight[0]:.3f}  Fake={class_weight[1]:.3f})")
+    return sample_weights
+
+
+def create_dataloaders(data_dir, batch_size=32, img_size=224, num_workers=0,
+                       train_split=0.8, frames_per_video=10,
+                       use_weighted_sampler=True):
     """
     Create training and validation dataloaders from SDFVD dataset.
     Automatically splits data into train/val sets.
-    
+
     Args:
-        data_dir: Directory containing the dataset (SDFVD format with videos_real and videos_fake)
-        batch_size: Batch size for training
+        data_dir: Directory containing the dataset
+        batch_size: Batch size
         img_size: Target image size
-        num_workers: Number of worker processes
-        train_split: Fraction of data to use for training (default: 0.8)
-        frames_per_video: Number of frames to extract per video
-        
+        num_workers: Worker processes (0 = main process; safest on Windows)
+        train_split: Fraction of data for training
+        frames_per_video: Frames to extract per video
+        use_weighted_sampler: Balance classes via WeightedRandomSampler
+
     Returns:
-        train_loader: Training dataloader
-        val_loader: Validation dataloader
+        train_loader, val_loader
     """
-    # Check if train/val split already exists
     train_dir = os.path.join(data_dir, 'train')
-    val_dir = os.path.join(data_dir, 'val')
-    
-    # If train/val directories don't exist, create them and split the data
+    val_dir   = os.path.join(data_dir, 'val')
+
     if not os.path.exists(train_dir) or not os.path.exists(val_dir) or \
        (os.path.exists(train_dir) and len(os.listdir(train_dir)) == 0):
         print("Creating train/val split...")
         _create_train_val_split(data_dir, train_split)
-    
-    # Get transforms
+
     train_transform = get_transforms(img_size, is_training=True)
-    val_transform = get_transforms(img_size, is_training=False)
-    
-    # Create datasets - pass frames_per_video to extract frames from videos
+    val_transform   = get_transforms(img_size, is_training=False)
+
     train_dataset = DeepfakeDataset(
-        train_dir, 
-        transform=train_transform, 
-        img_size=img_size, 
-        extract_frames=True,
-        frames_per_video=frames_per_video
-    )
+        train_dir, transform=train_transform, img_size=img_size,
+        extract_frames=True, frames_per_video=frames_per_video)
     val_dataset = DeepfakeDataset(
-        val_dir, 
-        transform=val_transform, 
-        img_size=img_size, 
-        extract_frames=True,
-        frames_per_video=frames_per_video
-    )
-    
-    # Create dataloaders
+        val_dir, transform=val_transform, img_size=img_size,
+        extract_frames=True, frames_per_video=frames_per_video)
+
+    # Balanced sampler: ensures each batch has ~50% real / ~50% fake
+    if use_weighted_sampler and len(train_dataset) > 0:
+        sample_weights = get_class_weights(train_dataset)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+        shuffle_train = False  # sampler and shuffle are mutually exclusive
+    else:
+        sampler       = None
+        shuffle_train = True
+
+    pin = torch.cuda.is_available()
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        train_dataset, batch_size=batch_size,
+        sampler=sampler, shuffle=shuffle_train,
+        num_workers=num_workers, pin_memory=pin
     )
-    
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin
     )
-    
+
     return train_loader, val_loader
 
 def _create_train_val_split(data_dir, train_split=0.8, seed=42):

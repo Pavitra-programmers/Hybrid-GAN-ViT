@@ -66,6 +66,21 @@ class VisionTransformer(nn.Module):
 
         return features, classification
 
+    def freeze_backbone(self):
+        """Freeze ViT encoder — only train projection/classifier heads."""
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+    def unfreeze_top_blocks(self, num_blocks: int = 4):
+        """Unfreeze the last num_blocks transformer layers for fine-tuning phase 2."""
+        transformer_layers = list(self.encoder.encoder.layers.children())
+        for layer in transformer_layers[-num_blocks:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+        # Always unfreeze the final LayerNorm
+        for param in self.encoder.encoder.ln.parameters():
+            param.requires_grad = True
+
     def get_attention_maps(self, x):
         """
         Compatibility stub — returns empty list.
