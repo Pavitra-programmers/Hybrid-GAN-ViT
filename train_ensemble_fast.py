@@ -160,7 +160,8 @@ def evaluate_ensemble(seq_model, par_model, val_ds, device, batch_size: int = 12
     return seq_loss, par_loss, acc, prec, rec, f1, v_acc, v_f1
 
 
-def train_one_fold(merged, train_idx, val_idx, fold_num, total_folds, args, device):
+def train_one_fold(merged, train_idx, val_idx, fold_num, total_folds, args, device,
+                   gan_raw_dim, vit_raw_dim):
     train_loader, val_loader, train_ds, val_ds = make_kfold_loaders(
         merged, train_idx, val_idx,
         batch_size=args.batch_size, num_workers=0,
@@ -174,8 +175,14 @@ def train_one_fold(merged, train_idx, val_idx, fold_num, total_folds, args, devi
           f"(train: {len(train_idx)} real={n_real_t} fake={n_fake_t};  "
           f"val: {len(val_idx)} real={n_real_v} fake={n_fake_v}) ───")
 
-    seq_model = SequentialHead(dropout=args.dropout).to(device)
-    par_model = ParallelHead(dropout=args.dropout).to(device)
+    seq_model = SequentialHead(
+        gan_raw_dim=gan_raw_dim, vit_raw_dim=vit_raw_dim,
+        dropout=args.dropout,
+    ).to(device)
+    par_model = ParallelHead(
+        gan_raw_dim=gan_raw_dim, vit_raw_dim=vit_raw_dim,
+        dropout=args.dropout,
+    ).to(device)
     seq_opt = optim.AdamW(seq_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     par_opt = optim.AdamW(par_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     seq_sched = optim.lr_scheduler.CosineAnnealingLR(seq_opt, T_max=max(1, args.epochs), eta_min=1e-6)
@@ -261,10 +268,13 @@ def main():
 
     merged = merge_caches_for_kfold(train_cache, val_cache)
     n_total = len(merged['labels'])
+    gan_raw_dim = merged['gan_feats'].shape[-1]
+    vit_raw_dim = merged['vit_feats'].shape[-1]
     print(f"  Total      : {n_total} frames "
           f"(real={int((merged['labels']==0).sum())}, "
           f"fake={int((merged['labels']==1).sum())}, "
           f"K augs={merged['num_aug']})")
+    print(f"  Feature dims: GAN={gan_raw_dim}  ViT={vit_raw_dim}")
 
     skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
     labels_np = merged['labels'].numpy()
@@ -277,6 +287,7 @@ def main():
             skf.split(np.zeros(n_total), labels_np), start=1):
         fold_acc, fold_state, fold_metrics = train_one_fold(
             merged, tr_idx, va_idx, fold, args.folds, args, device,
+            gan_raw_dim, vit_raw_dim,
         )
         fold_accs.append(fold_acc)
         fold_f1s.append(fold_metrics['val_f1'])
@@ -297,6 +308,9 @@ def main():
                 'cv_mean_video_acc': None,
                 'cv_std_video_acc': None,
                 'args': vars(args),
+            'gan_raw_dim': gan_raw_dim,
+            'vit_raw_dim': vit_raw_dim,
+            'vit_backbone': merged.get('vit_backbone', 'vit_b_16'),
             }
 
     mean_acc = float(np.mean(fold_accs))
@@ -329,7 +343,10 @@ def main():
             'cv_mean_acc': mean_acc, 'cv_std_acc': std_acc,
             'all_fold_accs': best_payload['all_fold_accs'],
             'all_fold_f1s': best_payload['all_fold_f1s'],
-            'args': vars(args), 'source': 'train_ensemble_fast.py',
+            'args': vars(args),
+            'gan_raw_dim': gan_raw_dim,
+            'vit_raw_dim': vit_raw_dim,
+            'vit_backbone': merged.get('vit_backbone', 'vit_b_16'), 'source': 'train_ensemble_fast.py',
         }, 'checkpoints/sequential_fast/SequentialHead_best.pth')
         torch.save({
             'fold': best_payload['fold'],
@@ -338,7 +355,10 @@ def main():
             'cv_mean_acc': mean_acc, 'cv_std_acc': std_acc,
             'all_fold_accs': best_payload['all_fold_accs'],
             'all_fold_f1s': best_payload['all_fold_f1s'],
-            'args': vars(args), 'source': 'train_ensemble_fast.py',
+            'args': vars(args),
+            'gan_raw_dim': gan_raw_dim,
+            'vit_raw_dim': vit_raw_dim,
+            'vit_backbone': merged.get('vit_backbone', 'vit_b_16'), 'source': 'train_ensemble_fast.py',
         }, 'checkpoints/parallel_fast/ParallelHead_best.pth')
 
     print(f"\n{'='*70}")

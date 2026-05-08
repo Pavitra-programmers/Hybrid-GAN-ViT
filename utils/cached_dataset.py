@@ -106,6 +106,8 @@ def merge_caches_for_kfold(train_cache_path: str, val_cache_path: str) -> dict:
     paths = list(train['paths']) + list(val['paths'])
     video_ids = list(train['video_ids']) + list(val['video_ids'])
 
+    train_meta = train.get('meta', {})
+    val_meta = val.get('meta', {})
     return {
         'gan_feats': gan,
         'vit_feats': vit,
@@ -115,6 +117,10 @@ def merge_caches_for_kfold(train_cache_path: str, val_cache_path: str) -> dict:
         'n_train': len(train['labels']),
         'n_val': len(val['labels']),
         'num_aug': K,
+        'vit_backbone': train_meta.get('vit_backbone',
+                                       val_meta.get('vit_backbone', 'vit_b_16')),
+        'gan_dim': train_meta.get('gan_dim', gan.shape[-1]),
+        'vit_dim': train_meta.get('vit_dim', vit.shape[-1]),
     }
 
 

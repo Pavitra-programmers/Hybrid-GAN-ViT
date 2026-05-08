@@ -48,19 +48,29 @@ NORMALIZE = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
 
 
-def load_backbones(device: torch.device):
+def load_backbones(device: torch.device, vit_backbone: str = 'vit_b_16'):
     try:
-        from torchvision.models import EfficientNet_B4_Weights, ViT_B_16_Weights
+        from torchvision.models import EfficientNet_B4_Weights
         eff = tv_models.efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
-        vit = tv_models.vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
     except (AttributeError, ImportError):
         eff = tv_models.efficientnet_b4(pretrained=True)
-        vit = tv_models.vit_b_16(pretrained=True)
-
     eff_features = eff.features.to(device).eval()
     eff_pool = eff.avgpool.to(device).eval()
-    vit.heads = nn.Identity()
-    vit = vit.to(device).eval()
+
+    if vit_backbone == 'vit_b_16':
+        try:
+            from torchvision.models import ViT_B_16_Weights
+            vit = tv_models.vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+        except (AttributeError, ImportError):
+            vit = tv_models.vit_b_16(pretrained=True)
+        vit.heads = nn.Identity()
+        vit = vit.to(device).eval()
+    elif vit_backbone.startswith('dinov2_'):
+        vit = torch.hub.load('facebookresearch/dinov2', vit_backbone,
+                             trust_repo=True, verbose=False).to(device).eval()
+    else:
+        raise ValueError(f"Unknown vit_backbone: {vit_backbone!r}")
+
     for m in (eff_features, eff_pool, vit):
         for p in m.parameters():
             p.requires_grad = False
@@ -97,9 +107,12 @@ def encode(views: torch.Tensor, eff_features, eff_pool, vit):
 
 
 def load_head(model_type: str, ckpt_path: str, device: torch.device):
-    head = (SequentialHead(dropout=0.0) if model_type == 'sequential'
-            else ParallelHead(dropout=0.0)).to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    gan_raw_dim = ckpt.get('gan_raw_dim', 1792)
+    vit_raw_dim = ckpt.get('vit_raw_dim', 768)
+    head_cls = SequentialHead if model_type == 'sequential' else ParallelHead
+    head = head_cls(gan_raw_dim=gan_raw_dim, vit_raw_dim=vit_raw_dim,
+                    dropout=0.0).to(device)
     head.load_state_dict(ckpt['model_state_dict'])
     head.eval()
     return head, ckpt
@@ -182,7 +195,17 @@ def main():
             print(f"  {name:>10s}  CV (5-fold) mean ± std: "
                   f"{cv_mean*100:.2f}% ± {cv_std*100:.2f}%")
 
-    eff_features, eff_pool, vit = load_backbones(device)
+    # Determine which backbone to load from any of the checkpoint(s).
+    # All loaded heads must share the same backbone — they're trained on the
+    # same feature cache, so this is enforced by construction.
+    backbones = {c.get('vit_backbone', 'vit_b_16') for _name, _h, c in heads}
+    if len(backbones) > 1:
+        print(f"  WARNING: checkpoints disagree on backbone: {backbones}. "
+              f"Using {next(iter(backbones))}.")
+    vit_backbone = next(iter(backbones))
+    print(f"  Backbone: EfficientNet-B4 + {vit_backbone}")
+
+    eff_features, eff_pool, vit = load_backbones(device, vit_backbone)
     views = preprocess(args.image, use_tta=not args.no_tta).to(device)
     n_views = views.shape[0]
     gan_feat, vit_feat = encode(views, eff_features, eff_pool, vit)

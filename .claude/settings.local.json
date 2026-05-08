@@ -9,7 +9,8 @@
       "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['utils/cached_dataset.py','train_sequential_fast.py','train_parallel_fast.py','demo.py','models/cached_heads.py']]; print\\('all syntax OK'\\)\")",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('demo.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('extract_ff_frames.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['train_sequential_fast.py','train_parallel_fast.py','train_ensemble_fast.py']]; print\\('all syntax OK'\\)\")"
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['train_sequential_fast.py','train_parallel_fast.py','train_ensemble_fast.py']]; print\\('all syntax OK'\\)\")",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['utils/feature_cache.py','utils/cached_dataset.py','extract_features.py','train_sequential_fast.py','train_parallel_fast.py','train_ensemble_fast.py','demo.py','models/cached_heads.py']]; print\\('all syntax OK'\\)\")"
     ]
   }
 }

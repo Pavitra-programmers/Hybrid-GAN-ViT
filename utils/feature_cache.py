@@ -37,36 +37,58 @@ from tqdm import tqdm
 
 
 GAN_FEAT_DIM = 1792   # EfficientNet-B4 avgpool output
-VIT_FEAT_DIM = 768    # ViT-B/16 CLS dim
 DEFAULT_NUM_AUG = 5   # augmented copies per frame in the cache
 
+# Output dim of the supported ViT backbones (CLS token).
+VIT_BACKBONE_DIMS = {
+    'vit_b_16':       768,    # torchvision ViT-B/16 (ImageNet1K-pretrained)
+    'dinov2_vits14':  384,    # DINOv2 ViT-S/14
+    'dinov2_vitb14':  768,    # DINOv2 ViT-B/14
+    'dinov2_vitl14':  1024,   # DINOv2 ViT-L/14  ← strongest, ~1.1 GB download
+    'dinov2_vitg14':  1536,   # DINOv2 ViT-g/14  ← largest, ~5 GB download
+}
 
-def _load_frozen_encoders(device: torch.device):
-    """Load pretrained EfficientNet-B4 (avgpool output) + ViT-B/16 (CLS token), frozen, eval."""
+
+def _load_frozen_encoders(device: torch.device, vit_backbone: str = 'vit_b_16'):
+    """Load EfficientNet-B4 + the requested ViT backbone, frozen, in eval mode.
+
+    Returns (eff_features, eff_pool, vit, vit_dim).  `vit` is a callable that
+    takes a (B, 3, 224, 224) tensor and returns a (B, vit_dim) CLS embedding.
+    """
     try:
-        from torchvision.models import EfficientNet_B4_Weights, ViT_B_16_Weights
+        from torchvision.models import EfficientNet_B4_Weights
         eff = tv_models.efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
-        vit = tv_models.vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
     except (AttributeError, ImportError):
         eff = tv_models.efficientnet_b4(pretrained=True)
-        vit = tv_models.vit_b_16(pretrained=True)
-
-    # EfficientNet path: features → avgpool → flatten → 1792-dim
     eff_features = eff.features.to(device).eval()
     eff_pool = eff.avgpool.to(device).eval()
-
-    # ViT: replace head with identity so encoder() returns CLS embedding (768-dim)
-    vit.heads = torch.nn.Identity()
-    vit = vit.to(device).eval()
-
-    for p in eff_features.parameters():
+    for p in list(eff_features.parameters()) + list(eff_pool.parameters()):
         p.requires_grad = False
-    for p in eff_pool.parameters():
-        p.requires_grad = False
+
+    if vit_backbone == 'vit_b_16':
+        try:
+            from torchvision.models import ViT_B_16_Weights
+            vit = tv_models.vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+        except (AttributeError, ImportError):
+            vit = tv_models.vit_b_16(pretrained=True)
+        vit.heads = torch.nn.Identity()
+        vit = vit.to(device).eval()
+    elif vit_backbone.startswith('dinov2_'):
+        # torch.hub fetches from facebookresearch/dinov2; first call downloads
+        # weights (cached in ~/.cache/torch/hub).
+        vit = torch.hub.load('facebookresearch/dinov2', vit_backbone,
+                             trust_repo=True, verbose=False)
+        vit = vit.to(device).eval()
+    else:
+        raise ValueError(f"Unknown vit_backbone: {vit_backbone!r}. "
+                         f"Supported: {list(VIT_BACKBONE_DIMS)}")
+
     for p in vit.parameters():
         p.requires_grad = False
 
-    return eff_features, eff_pool, vit
+    if vit_backbone not in VIT_BACKBONE_DIMS:
+        raise ValueError(f"Unknown vit_backbone: {vit_backbone!r}")
+    return eff_features, eff_pool, vit, VIT_BACKBONE_DIMS[vit_backbone]
 
 
 def _get_train_transform(img_size: int):
@@ -138,9 +160,10 @@ def _collect_samples(split_dir: str):
     return samples
 
 
-def _signature_from_samples(samples, num_aug: int, img_size: int) -> str:
+def _signature_from_samples(samples, num_aug: int, img_size: int,
+                            vit_backbone: str = 'vit_b_16') -> str:
     h = hashlib.sha1()
-    h.update(f'aug={num_aug};size={img_size};n={len(samples)}'.encode())
+    h.update(f'aug={num_aug};size={img_size};n={len(samples)};vit={vit_backbone}'.encode())
     for path, label, vid in samples[:512]:   # truncated; fast and stable
         st = os.stat(path) if os.path.exists(path) else None
         size = st.st_size if st else 0
@@ -175,13 +198,17 @@ def extract_and_cache_features(
     num_workers: int = 0,
     device: Optional[torch.device] = None,
     force: bool = False,
+    vit_backbone: str = 'vit_b_16',
 ) -> dict:
     """
     Walk data_dir/{train,val}/{real,fake}/*.{jpg,png}, encode every frame with
-    frozen EfficientNet-B4 + ViT-B/16, and cache the resulting features.
+    frozen EfficientNet-B4 + the chosen ViT backbone, and cache the features.
 
     Train split: caches num_aug random-augmentation copies per frame.
     Val split:   caches a single deterministic (resized + normalized) copy.
+
+    vit_backbone: 'vit_b_16' (default) or 'dinov2_vits14' / 'dinov2_vitb14' /
+                  'dinov2_vitl14' / 'dinov2_vitg14'.
 
     Returns:
         dict with 'train_cache' and 'val_cache' file paths.
@@ -190,7 +217,7 @@ def extract_and_cache_features(
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(cache_dir, exist_ok=True)
 
-    eff_features, eff_pool, vit = _load_frozen_encoders(device)
+    eff_features, eff_pool, vit, vit_dim = _load_frozen_encoders(device, vit_backbone)
 
     out = {}
     for split, n_aug, transform_fn in [
@@ -208,7 +235,7 @@ def extract_and_cache_features(
             continue
 
         cache_path = os.path.join(cache_dir, f'{split}_features.pt')
-        signature = _signature_from_samples(samples, n_aug, img_size)
+        signature = _signature_from_samples(samples, n_aug, img_size, vit_backbone)
 
         if os.path.exists(cache_path) and not force:
             try:
@@ -226,7 +253,7 @@ def extract_and_cache_features(
 
         n = len(samples)
         gan_buf = torch.zeros((n, n_aug, GAN_FEAT_DIM), dtype=torch.float16)
-        vit_buf = torch.zeros((n, n_aug, VIT_FEAT_DIM), dtype=torch.float16)
+        vit_buf = torch.zeros((n, n_aug, vit_dim), dtype=torch.float16)
         labels = torch.tensor([s[1] for s in samples], dtype=torch.uint8)
         paths = [s[0] for s in samples]
         video_ids = [s[2] for s in samples]
@@ -256,7 +283,8 @@ def extract_and_cache_features(
                 'img_size': img_size,
                 'num_aug': n_aug,
                 'gan_dim': GAN_FEAT_DIM,
-                'vit_dim': VIT_FEAT_DIM,
+                'vit_dim': vit_dim,
+                'vit_backbone': vit_backbone,
             },
         }
         torch.save(cache, cache_path)

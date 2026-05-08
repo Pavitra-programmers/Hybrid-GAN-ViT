@@ -1,93 +1,124 @@
 # FakeShield — Hybrid Deepfake Detection via GAN + Vision Transformer
 
-> A dual-path deepfake detection system combining the artifact-catching power of
-> a pretrained **EfficientNet-B4** discriminator with the global-context reasoning
-> of a pretrained **ViT-B/16**, achieving up to **95–96% accuracy** on the SDFVD benchmark.
+> A two-stream deepfake detection system that fuses an **EfficientNet-B4**
+> CNN backbone (artifact-sensitive low-level features) with a pretrained
+> **Vision Transformer** (global context). Two fusion designs are compared
+> — Sequential and Parallel cross-attention — under stratified 5-fold cross-
+> validation on SDFVD. Best result: **94.30% ± 0.70% video accuracy** with
+> the Parallel head on DINOv2-B/14 features.
 
 ---
 
-## Overview
+## Headline numbers (5-fold stratified CV on SDFVD)
 
-Modern deepfakes are frighteningly convincing. **FakeShield** fights back by running
-two complementary analyses in parallel — one path hunts for pixel-level artifacts
-(compression ghosts, blending seams, texture inconsistencies), while the other
-reasons about the global structure of a face. Both streams are then fused with a
-cross-attention mechanism so each can inform the other before the final verdict.
+| Method | Backbone (ViT side) | Frame Acc | Video Acc |
+|---|---|---|---|
+| Linear probe (concat baseline) | ViT-B/16 | 91.19% ± 1.29% | — |
+| Sequential GAN+ViT | ViT-B/16 | 90.88% ± 1.35% | 92.52% ± 1.49% |
+| Parallel GAN+ViT | ViT-B/16 | 90.94% ± 0.64% | 91.93% ± 1.14% |
+| Sequential GAN+ViT | DINOv2-B/14 | 92.96% ± 0.51% | 93.11% ± 0.62% |
+| **Parallel GAN+ViT** | **DINOv2-B/14** | **93.27% ± 0.38%** | **94.30% ± 0.70%** |
+| Ensemble (Sequential + Parallel) | DINOv2-B/14 | 93.40% ± 0.44% | 93.70% ± 0.97% |
 
-Two architectures are provided and compared:
+All numbers are **mean ± standard deviation across 5 folds** (stratified, balanced
+real/fake per fold, seed 42). The Parallel architecture has the tightest std,
+indicating consistent generalisation.
+
+---
+
+## Why this approach
+
+A single CNN learns sharp local artifact features but struggles with global
+geometric inconsistencies; a single ViT captures global structure but
+under-attends to fine compression seams and blending edges. FakeShield runs
+**both** in parallel and lets them inform each other through cross-attention
+before a final fused classification.
+
+Two architectures are implemented and compared:
 
 | Architecture | Strategy |
 |---|---|
-| **Sequential** | EfficientNet attention guides ViT toward suspicious regions |
-| **Parallel** | Both models run simultaneously; bidirectional cross-attention fuses features |
+| **Sequential** | Concatenate GAN + ViT features, then 3-layer MLP fusion + auxiliary heads on each branch |
+| **Parallel** | Bidirectional cross-attention: GAN features query ViT features and vice versa, then fusion |
 
 ---
 
-## Architecture
+## Architecture diagrams
 
-### Sequential Model
+### Sequential head (`SequentialHead`)
 ```
-Input Image
-    │
-    ├─► EfficientNet-B4 (pretrained) ──► Fine-detail features + Attention map
-    │                                              │
-    │                  ┌────────────────────────────┘
-    │                  ▼
-    └─► ViT-B/16 (pretrained) ──► Global context features
-                       │
-              Feature Fusion (MLP)
-                       │
-               Final Classification
+gan_raw  (1792-d, frozen EffNet-B4 avgpool)        vit_raw (768-d, frozen ViT)
+   │                                                  │
+   ▼                                                  ▼
+GAN projector → 512-d  +  aux logit               ViT projector → 384-d  +  aux logit
+                       \\                           /
+                        Concat → 896-d
+                                │
+                  LayerNorm + GELU MLP (512→256)
+                                │
+                          Linear → 1 logit
 ```
 
-### Parallel Model
+### Parallel head (`ParallelHead`)
 ```
-Input Image
-    ├─► EfficientNet-B4 (pretrained) ──► GAN features ──┐
-    │                                                    ├─► Cross-Attention ──► Fusion ──► Output
-    └─► ViT-B/16 (pretrained)       ──► ViT features ──┘
+gan_raw                                vit_raw
+   │                                      │
+   ▼                                      ▼
+GAN projector (512-d)                 ViT projector (384-d)
+   │                                      │
+   └──────► Bidirectional Cross-Attention ◄─┘
+            (GAN ⇄ ViT, attention_dim=256)
+   │                                      │
+   ▼                                      ▼
+   gan_enhanced (512-d)         vit_enhanced (384-d)
+                       \\        /
+                        Concat → 896-d
+                                │
+                  LayerNorm + GELU MLP (512→256)
+                                │
+                          Linear → 1 logit
 ```
+
+The two backbones (EfficientNet-B4 + a chosen ViT — defaults to torchvision
+ViT-B/16; can be swapped to DINOv2 ViT-S/14, B/14, L/14, or g/14) are **always
+frozen**. Only the head trains. Their per-frame outputs are encoded once, cached
+to disk, and reused every epoch — making each CV fold finish in seconds.
 
 ---
 
-## Key Design Choices
-
-| Component | Choice | Why |
-|---|---|---|
-| CNN backbone | EfficientNet-B4 (ImageNet pretrained) | Strong low-level texture features out of the box |
-| ViT backbone | ViT-B/16 (ImageNet pretrained) | Global attention over 196 patches; transfer-learns well |
-| Optimizer | AdamW | Better weight decay handling than SGD for transformer models |
-| LR schedule | Linear warmup + Cosine annealing | Stable start, smooth decay |
-| Backbone LR | 10× smaller than head LR | Fine-tune without destroying pretrained features |
-| Loss | Focal BCE + label smoothing | Handles hard negatives; prevents overconfident predictions |
-| Auxiliary losses | α = 0.3 on GAN + ViT heads | Extra gradient signal through both paths |
-
----
-
-## Project Structure
+## Project layout
 
 ```
 FakeShield/
+├── extract_features.py          # One-time: encode every frame to disk
+├── train_sequential_fast.py     # 5-fold CV training of SequentialHead
+├── train_parallel_fast.py       # 5-fold CV training of ParallelHead
+├── train_ensemble_fast.py       # 5-fold CV co-training of both heads + ensemble eval
+├── demo.py                      # Inference on a single image (TTA + ensemble + abstention)
 ├── models/
-│   ├── __init__.py
-│   ├── gan_discriminator.py      # EfficientNet-B4 discriminator
-│   ├── vision_transformer.py     # ViT-B/16 encoder
-│   ├── sequential_model.py       # Sequential GAN→ViT fusion (full model)
-│   ├── parallel_model.py         # Parallel GAN‖ViT with cross-attention (full model)
-│   └── cached_heads.py           # Head-only models for fast training on cached features
+│   ├── cached_heads.py          # SequentialHead / ParallelHead (head-only models)
+│   ├── sequential_model.py      # Legacy full-backbone Sequential model
+│   ├── parallel_model.py        # Legacy full-backbone Parallel model
+│   ├── gan_discriminator.py
+│   └── vision_transformer.py
 ├── utils/
-│   ├── __init__.py
-│   ├── data_utils.py             # Dataset loading, augmentation, SDFVD support
-│   ├── feature_cache.py          # One-time encoder pass → on-disk feature cache
-│   └── cached_dataset.py         # Dataset/DataLoader for cached feature vectors
-├── extract_features.py           # Run once: encode every frame to disk
-├── train_sequential_fast.py      # Fast head-only training (cached features)
-├── train_parallel_fast.py        # Fast head-only training (cached features)
-├── train_sequential.py           # Legacy full-model two-phase training
-├── train_parallel.py             # Legacy full-model two-phase training
-├── demo.py                       # Inference & visualisation
+│   ├── feature_cache.py         # Frozen-encoder pass + on-disk cache
+│   ├── cached_dataset.py        # Datasets / DataLoaders for cached features
+│   └── data_utils.py            # SDFVD frame extraction (legacy path)
+├── checkpoints/
+│   ├── sequential_fast/SequentialHead_best.pth
+│   ├── parallel_fast/ParallelHead_best.pth
+│   └── ensemble_fast/Ensemble_best.pth
+├── feature_cache/               # Cached encoder features (ViT-B/16)
+├── feature_cache_dinov2/        # Cached encoder features (DINOv2 backbone)
+├── SDFVD/
+│   ├── videos_real/             # raw real videos
+│   ├── videos_fake/             # raw deepfake videos
+│   ├── train/{real,fake}/       # per-class video subsets (auto-created)
+│   └── val/{real,fake}/         # per-class video subsets (auto-created)
 ├── requirements.txt
-└── README.md
+├── README.md
+└── report.txt
 ```
 
 ---
@@ -95,150 +126,289 @@ FakeShield/
 ## Installation
 
 ```bash
-# 1. Clone
 git clone <your-repo-url>
-cd FakeShield
+cd "Research Paper"
 
-# 2. Create virtual environment
 python -m venv env
-source env/bin/activate        # Windows: env\Scripts\activate
+# Windows:
+env\Scripts\activate
+# Linux / macOS:
+source env/bin/activate
 
-# 3. Install dependencies
 pip install -r requirements.txt
 ```
 
+Tested on Windows 11 with Python 3.10, PyTorch 2.x, CUDA 11.8, and an
+NVIDIA GeForce GTX 1650 (4 GB VRAM).
+
 ---
 
-## Dataset Setup (SDFVD)
+## Dataset setup (SDFVD)
 
-Place the SDFVD dataset in the project root:
+The first run extracts frames from raw `videos_real/` and `videos_fake/`
+folders into `SDFVD/{train,val}/extracted_frames/{real,fake}/`. After that,
+all training operates on the cached feature files and never re-decodes video.
+
+If you start from a fresh SDFVD download:
 
 ```
 SDFVD/
-├── videos_real/    ← real face videos
-└── videos_fake/    ← deepfake videos
+├── videos_real/
+│   ├── v1.mp4
+│   └── ...
+└── videos_fake/
+    ├── vs1.mp4
+    └── ...
 ```
 
-The training script automatically extracts frames and creates an 80/20 train/val split.
+The legacy frame-extraction path (run once via `python -c "from utils.data_utils
+import _create_train_val_split, DeepfakeDataset; _create_train_val_split('./SDFVD');
+DeepfakeDataset('./SDFVD/train'); DeepfakeDataset('./SDFVD/val')"`) writes the
+extracted JPGs into the per-class folders before feature caching.
 
 ---
 
-## Training
+## Pipeline overview
 
-There are two training paths. **Use the fast path unless you need to fine-tune
-the EfficientNet-B4 / ViT-B/16 backbones themselves.**
+The full training cycle has three independent stages:
 
-### Fast path — encode-then-train (recommended)
+1. **Cache features once** — `extract_features.py` runs the frozen backbones
+   over every frame and saves the resulting (1792-d EffNet, *D*-d ViT) vectors.
+2. **Train heads with 5-fold CV** — `train_*_fast.py` reads the cache, splits
+   the combined train+val pool into 5 stratified folds, trains a fresh head per
+   fold, and reports mean ± std accuracy.
+3. **Run inference** — `demo.py` loads the best checkpoint, encodes a single
+   image via the same frozen backbones, applies 10-crop TTA + (optionally)
+   ensemble averaging, and prints `P(fake)` with a 3-state decision band.
 
-The original training loop wastes most of its time re-running the **frozen**
-EfficientNet-B4 + ViT-B/16 backbones on the same frames every epoch. Their
-output never changes, so we encode each frame **once** and train only the
-small fusion + classifier heads on the cached vectors. Result: head training
-goes from minutes-per-epoch to seconds-per-epoch.
+---
+
+## Quick start (3 commands)
 
 ```bash
-# 1. One-time feature extraction (a few minutes on GPU)
+# 1.  Cache features once  (~3 hr on a GTX 1650 for K=5 augmentations)
 python extract_features.py
-#    → SDFVD/{train,val} → feature_cache/{train,val}_features.pt
-#    Caches K=5 random-augmentation copies per train frame so head training
-#    still benefits from augmentation diversity.
 
-# 2. Fast head-only training (seconds per epoch)
+# 2.  Train all three models  (~10 minutes total — features are cached)
 python train_sequential_fast.py
 python train_parallel_fast.py
-#    → checkpoints/{sequential_fast,parallel_fast}/<Model>_best.pth
+python train_ensemble_fast.py
+
+# 3.  Test on an image
+python demo.py "path/to/image.jpg" --model ensemble
 ```
 
-The fast trainers add three accuracy-boosting techniques:
-- **Multi-augmentation feature cache** (K=5 copies per train frame).
-- **Mixup in feature space** — mixes two samples' encoder vectors with a shared λ.
-- **Video-level metric reporting** — averages predictions across each video's
-  frames before computing accuracy / F1; the best checkpoint is selected on
-  this metric (closer to deployment than per-frame accuracy).
+Each command is detailed below.
 
-If you change the dataset or image size, regenerate the cache:
-```bash
-python extract_features.py --force
-```
+---
 
-### Full fine-tuning path (legacy)
-
-If you want to also fine-tune the backbone weights, the original two-phase
-trainers still work:
+## Step 1 — Feature extraction
 
 ```bash
-python train_sequential.py       # frozen-backbone phase + partial-unfreeze phase
-python train_parallel.py
+python extract_features.py [options]
 ```
 
-### Hyperparameters
-
-| Parameter | Fast path | Legacy |
+| Flag | Default | Meaning |
 |---|---|---|
-| Image size | 224 × 224 | 224 × 224 |
-| Batch size | 256 | 32 |
-| Head learning rate | 1e-3 | 1e-3 (P1) / 1e-4 (P2) |
-| Backbone learning rate | n/a (frozen) | 1e-5 (P2) |
-| Weight decay | 1e-4 | 1e-4 |
-| Epochs | 80 (head only) | 30 + 20 (two phases) |
-| Frames per video | 15 | 15 |
-| Cached aug copies (K) | 5 | n/a |
-| Mixup α | 0.2 | 0 |
+| `--data-dir` | `./SDFVD` | Dataset root containing `train/` and `val/` |
+| `--cache-dir` | `./feature_cache` | Where the `train_features.pt` / `val_features.pt` files are saved |
+| `--vit-backbone` | `vit_b_16` | Choose `vit_b_16`, `dinov2_vits14`, `dinov2_vitb14`, `dinov2_vitl14`, `dinov2_vitg14` |
+| `--img-size` | `224` | Encoder input resolution |
+| `--batch-size` | `64` | Encoding batch size (drop to 16–32 for DINOv2 ViT-L/14 on 4 GB GPUs) |
+| `--num-aug` | `5` | Number of augmented copies cached per train frame (val uses 1) |
+| `--force` | off | Rebuild even if signature matches |
 
----
-
-## Inference / Demo
+**Use a separate cache directory per backbone** so they don't overwrite each other:
 
 ```bash
-python demo.py
+# ViT-B/16 (default)
+python extract_features.py --cache-dir ./feature_cache
+
+# DINOv2 ViT-B/14 (drop-in replacement, +2 pts CV accuracy)
+python extract_features.py --vit-backbone dinov2_vitb14 --cache-dir ./feature_cache_dinov2
+
+# DINOv2 ViT-L/14 (larger, slower; potentially +1 more pt)
+python extract_features.py --vit-backbone dinov2_vitl14 --cache-dir ./feature_cache_dinov2 --batch-size 16
 ```
 
-Runs both models on synthetic test data and saves visualisations showing:
-- Detection result and probability
-- GAN attention maps (suspicious regions)
-- Feature importance plots
+The DINOv2 weights are downloaded once via `torch.hub` from facebookresearch/dinov2
+and cached to `~/.cache/torch/hub/`.
 
 ---
 
-## Results
+## Step 2 — Training
 
-| Model | Accuracy | Precision | Recall | F1 |
-|---|---|---|---|---|
-| Sequential GAN+ViT | ~95% | ~94% | ~95% | ~94% |
-| Parallel GAN+ViT | ~96% | ~95% | ~96% | ~95% |
+All three trainers share the same CLI surface:
 
-> Results on SDFVD validation split. Actual numbers depend on GPU, dataset size, and training duration.
+| Flag | Default | Meaning |
+|---|---|---|
+| `--cache-dir` | `./feature_cache` | Which feature cache to read |
+| `--folds` | `5` | Number of stratified CV folds |
+| `--epochs` | `40` | Maximum epochs per fold |
+| `--batch-size` | `128` | Training batch size |
+| `--lr` | `3e-4` | AdamW learning rate |
+| `--weight-decay` | `5e-3` | AdamW weight decay |
+| `--patience` | `15` | Early-stop patience (epochs without improvement) |
+| `--dropout` | `0.3` | Head dropout |
+| `--seed` | `42` | RNG seed (controls fold split) |
+
+```bash
+# Sequential head only
+python train_sequential_fast.py --cache-dir ./feature_cache_dinov2
+
+# Parallel head only
+python train_parallel_fast.py --cache-dir ./feature_cache_dinov2
+
+# Ensemble: trains both heads per fold, evaluates them as an ensemble
+python train_ensemble_fast.py --cache-dir ./feature_cache_dinov2
+```
+
+Outputs:
+- Per-fold val accuracy / F1 / video-level accuracy
+- Cross-validation mean ± std (frame and video)
+- Best fold's checkpoint saved to `checkpoints/{sequential,parallel,ensemble}_fast/`
+
+The ensemble trainer also writes its trained Sequential and Parallel models
+into the standalone checkpoint paths, so `demo.py` can load any of them.
+
+### Loss & training details
+
+- **Loss**: `BCEWithLogitsLoss` on the main output + auxiliary BCE on the
+  GAN-branch and ViT-branch logits with weight α = 0.1.
+- **Label smoothing** ε = 0.1 (smoothed targets passed to BCE-with-logits).
+- **Sampler**: `WeightedRandomSampler` for class balance (the SDFVD splits
+  are balanced, but we keep this in case a future dataset isn't).
+- **Scheduler**: `CosineAnnealingLR` over the full max-epoch budget.
+- **Eval-time TTA**: every val frame is scored at all K=5 cached augmentations
+  and the sigmoid probabilities are averaged before thresholding.
+- **Best-checkpoint selection**: highest *frame* val accuracy per fold (lower
+  variance than 22-video-level F1 on SDFVD).
 
 ---
 
-## Interpretability
+## Step 3 — Inference
 
-FakeShield provides several visualisation tools:
+```bash
+python demo.py "C:\path\to\image.jpg" [--model {sequential|parallel|ensemble|auto}] [--no-tta]
+```
 
-- **GAN Attention Map** — spatial heatmap of regions the EfficientNet discriminator flagged
-- **Cross-Attention Weights** — how the two streams influence each other (Parallel model)
-- **Feature Importance** — channel-wise feature norms projected back to image space
-- **Confidence Score** — model's self-reported certainty (Parallel model)
+| Flag | Default | Meaning |
+|---|---|---|
+| (positional) `image` | — | Path to the image to classify |
+| `--model` | `auto` | `sequential`, `parallel`, `ensemble`, or `auto` (uses ensemble if both checkpoints exist) |
+| `--no-tta` | off | Skip 10-crop TTA (faster, slightly less robust) |
+| `--threshold-low` | `0.35` | P(fake) below this → REAL |
+| `--threshold-high` | `0.65` | P(fake) above this → FAKE |
+| `--seq-ckpt` | `checkpoints/sequential_fast/SequentialHead_best.pth` | Sequential checkpoint |
+| `--par-ckpt` | `checkpoints/parallel_fast/ParallelHead_best.pth` | Parallel checkpoint |
+
+What the demo does in order:
+
+1. Reads the checkpoint metadata to find which backbone (e.g. `dinov2_vitb14`)
+   and which feature dimensions were used during training.
+2. Loads the matching frozen backbones (EfficientNet-B4 + the chosen ViT).
+3. Preprocesses the input image into 10 TTA views (4 corners + center, plus
+   their horizontal flips), or 1 view with `--no-tta`.
+4. Encodes all views through the frozen backbones.
+5. Runs the head(s) on every view's features.
+6. Averages sigmoid probabilities across views and (for ensemble) across heads.
+7. Prints `P(fake)` mean and range, plus a 3-state decision: `REAL` /
+   `UNCERTAIN` / `FAKE`.
+
+Example output:
+```
+Device: cuda
+Mode  : ensemble  (TTA: 10-crop)
+  sequential  CV (5-fold) mean ± std: 93.40% ± 0.44%
+    parallel  CV (5-fold) mean ± std: 93.40% ± 0.44%
+  Backbone: EfficientNet-B4 + dinov2_vitb14
+
+Image: C:\path\to\image.jpg
+  Views encoded   : 10
+  P(fake) mean    :  20.92%
+  P(fake) range   :   3.89% —  63.28%
+  Decision band   : REAL < 35%  |  UNCERTAIN  |  FAKE > 65%
+  →  REAL
+```
+
+The `UNCERTAIN` zone is intentional. On out-of-distribution images (random
+photos, screenshots, AI-generated images that don't match SDFVD's
+manipulation style), the model abstains rather than confidently mis-classifying.
+
+---
+
+## Reproducing the headline result
+
+```bash
+# 1. Extract features with DINOv2 ViT-B/14 (one-time, ~3 hr on GTX 1650)
+python extract_features.py --vit-backbone dinov2_vitb14 --cache-dir ./feature_cache_dinov2
+
+# 2. Train all three (~10 minutes total)
+python train_sequential_fast.py --cache-dir ./feature_cache_dinov2
+python train_parallel_fast.py   --cache-dir ./feature_cache_dinov2
+python train_ensemble_fast.py   --cache-dir ./feature_cache_dinov2
+```
+
+Expected output (seed=42):
+- Sequential: ~92.96% ± 0.51% frame, ~93.11% ± 0.62% video
+- Parallel:   ~93.27% ± 0.38% frame, ~94.30% ± 0.70% video  ← **best video**
+- Ensemble:   ~93.40% ± 0.44% frame, ~93.70% ± 0.97% video  ← **best frame**
+
+---
+
+## Hyperparameters reference
+
+| Parameter | Value | Notes |
+|---|---|---|
+| Image size | 224 × 224 | Standard for both backbones |
+| Optimiser | AdamW | β₁=0.9, β₂=0.999 |
+| Learning rate (head) | 3e-4 | Default for all three trainers |
+| Weight decay | 5e-3 | Heavy regularisation; small dataset |
+| Mixup α | 0 (disabled) | K=5 cached augmentations already provide variance |
+| Aux-loss weight α | 0.1 | Auxiliary GAN/ViT branch losses |
+| Label smoothing ε | 0.1 | Symmetric (ε/2 on each class) |
+| Dropout | 0.3 | In all head MLP layers |
+| Batch size | 128 | Heads are tiny; bigger batch is fine |
+| Epochs (max) | 40 | Per fold |
+| Early-stop patience | 15 | Frame-level val acc, no improvement |
+| LR schedule | Cosine | T_max = epochs, η_min = 1e-6 |
+| K (cached aug copies) | 5 | Train side; val uses K=1 |
+| Eval-time TTA | All K augs averaged | Free since features are cached |
 
 ---
 
 ## Limitations
 
-- Requires a GPU for reasonable training times
-- Performance drops on very high-quality GAN-generated deepfakes not in training distribution
-- Video-level predictions are frame-averaged (temporal modelling is future work)
+- **SDFVD is small** (~106 unique videos, 1,590 frames after extraction). The
+  reported standard deviations are tight, but a single random train/val split
+  has high variance — that's why we report 5-fold CV.
+- **Single-domain training**. Models trained on SDFVD generalise well to
+  SDFVD-like videos and poorly to images outside that distribution (UI
+  screenshots, text-to-image AI art, casual phone photos in unseen settings).
+  The `UNCERTAIN` decision band exposes this honestly rather than hiding it.
+- **Frame-level model**. Temporal coherence between consecutive frames is not
+  modelled. Video-level accuracy is computed by averaging per-frame
+  predictions.
+- **Backbone is frozen**. We do not fine-tune EfficientNet-B4 or the ViT — both
+  for speed and to avoid overfitting on a corpus this small.
 
 ---
 
-## Future Work
+## Future work
 
-- Temporal modelling (LSTM / Transformer over frame sequences)
-- Frequency-domain branch (DCT/FFT features for compression artifact detection)
-- Adversarial fine-tuning for robustness against adaptive attacks
-- Lightweight distilled version for real-time mobile inference
+- **Cross-dataset evaluation** — train on FaceForensics++ or Celeb-DF, test
+  zero-shot on SDFVD. The feature cache + head trainers are dataset-agnostic;
+  dropping in a second cache reuses the entire pipeline.
+- **Temporal model** — LSTM or temporal Transformer over per-frame features.
+- **Frequency-domain branch** — DCT/FFT features as a third stream alongside
+  GAN and ViT, for compression-artifact detection.
+- **DINOv2 ViT-L/14 or ViT-g/14** — strictly larger backbones; modest expected
+  lift but at significant extraction-time cost.
+- **End-to-end fine-tuning** — unfreeze the last few backbone blocks for the
+  final epochs of training, weighed against the overfitting risk.
 
 ---
 
 ## License
 
-This project is released under the [MIT License](LICENSE) — free to use, modify, and distribute.
+MIT. See [LICENSE](LICENSE).
