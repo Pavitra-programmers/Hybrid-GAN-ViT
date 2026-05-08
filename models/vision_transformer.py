@@ -1,3 +1,4 @@
+import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -55,8 +56,14 @@ class VisionTransformer(nn.Module):
             features: Extracted features (batch_size, embed_dim // 2) for fusion
             classification: Binary classification output (batch_size, 1)
         """
-        # Extract CLS token features via pretrained ViT-B/16
-        cls_features = self.encoder(x)               # (B, 768)
+        # Run frozen encoder under no_grad to save memory and speed up forward pass
+        _frozen = not next(self.encoder.parameters()).requires_grad
+        _ctx = torch.no_grad() if _frozen else contextlib.nullcontext()
+        with _ctx:
+            cls_features = self.encoder(x)           # (B, 768)
+
+        # Cast to float32 — prevents float16 overflow in the downstream Linear projection
+        cls_features = cls_features.float()
 
         # Project to fusion-compatible dimension
         features = self.feature_extractor(cls_features)  # (B, embed_dim // 2)

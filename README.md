@@ -72,12 +72,19 @@ FakeShield/
 │   ├── __init__.py
 │   ├── gan_discriminator.py      # EfficientNet-B4 discriminator
 │   ├── vision_transformer.py     # ViT-B/16 encoder
-│   ├── sequential_model.py       # Sequential GAN→ViT fusion
-│   └── parallel_model.py         # Parallel GAN‖ViT with cross-attention
+│   ├── sequential_model.py       # Sequential GAN→ViT fusion (full model)
+│   ├── parallel_model.py         # Parallel GAN‖ViT with cross-attention (full model)
+│   └── cached_heads.py           # Head-only models for fast training on cached features
 ├── utils/
 │   ├── __init__.py
-│   └── data_utils.py             # Dataset loading, augmentation, SDFVD support
-├── train.py                      # Training script
+│   ├── data_utils.py             # Dataset loading, augmentation, SDFVD support
+│   ├── feature_cache.py          # One-time encoder pass → on-disk feature cache
+│   └── cached_dataset.py         # Dataset/DataLoader for cached feature vectors
+├── extract_features.py           # Run once: encode every frame to disk
+├── train_sequential_fast.py      # Fast head-only training (cached features)
+├── train_parallel_fast.py        # Fast head-only training (cached features)
+├── train_sequential.py           # Legacy full-model two-phase training
+├── train_parallel.py             # Legacy full-model two-phase training
 ├── demo.py                       # Inference & visualisation
 ├── requirements.txt
 └── README.md
@@ -118,27 +125,65 @@ The training script automatically extracts frames and creates an 80/20 train/val
 
 ## Training
 
+There are two training paths. **Use the fast path unless you need to fine-tune
+the EfficientNet-B4 / ViT-B/16 backbones themselves.**
+
+### Fast path — encode-then-train (recommended)
+
+The original training loop wastes most of its time re-running the **frozen**
+EfficientNet-B4 + ViT-B/16 backbones on the same frames every epoch. Their
+output never changes, so we encode each frame **once** and train only the
+small fusion + classifier heads on the cached vectors. Result: head training
+goes from minutes-per-epoch to seconds-per-epoch.
+
 ```bash
-python train.py
+# 1. One-time feature extraction (a few minutes on GPU)
+python extract_features.py
+#    → SDFVD/{train,val} → feature_cache/{train,val}_features.pt
+#    Caches K=5 random-augmentation copies per train frame so head training
+#    still benefits from augmentation diversity.
+
+# 2. Fast head-only training (seconds per epoch)
+python train_sequential_fast.py
+python train_parallel_fast.py
+#    → checkpoints/{sequential_fast,parallel_fast}/<Model>_best.pth
 ```
 
-This will:
-- Load SDFVD, extract frames, build dataloaders
-- Train both Sequential and Parallel models for up to 50 epochs
-- Save best checkpoints to `checkpoints/sequential/` and `checkpoints/parallel/`
-- Plot training curves to `sequential_training_history.png` / `parallel_training_history.png`
+The fast trainers add three accuracy-boosting techniques:
+- **Multi-augmentation feature cache** (K=5 copies per train frame).
+- **Mixup in feature space** — mixes two samples' encoder vectors with a shared λ.
+- **Video-level metric reporting** — averages predictions across each video's
+  frames before computing accuracy / F1; the best checkpoint is selected on
+  this metric (closer to deployment than per-frame accuracy).
 
-### Hyperparameters (defaults)
+If you change the dataset or image size, regenerate the cache:
+```bash
+python extract_features.py --force
+```
 
-| Parameter | Value |
-|---|---|
-| Image size | 224 × 224 |
-| Batch size | 8 |
-| Head learning rate | 1e-4 |
-| Backbone learning rate | 1e-5 |
-| Weight decay | 1e-4 |
-| Epochs | 50 |
-| Frames per video | 15 |
+### Full fine-tuning path (legacy)
+
+If you want to also fine-tune the backbone weights, the original two-phase
+trainers still work:
+
+```bash
+python train_sequential.py       # frozen-backbone phase + partial-unfreeze phase
+python train_parallel.py
+```
+
+### Hyperparameters
+
+| Parameter | Fast path | Legacy |
+|---|---|---|
+| Image size | 224 × 224 | 224 × 224 |
+| Batch size | 256 | 32 |
+| Head learning rate | 1e-3 | 1e-3 (P1) / 1e-4 (P2) |
+| Backbone learning rate | n/a (frozen) | 1e-5 (P2) |
+| Weight decay | 1e-4 | 1e-4 |
+| Epochs | 80 (head only) | 30 + 20 (two phases) |
+| Frames per video | 15 | 15 |
+| Cached aug copies (K) | 5 | n/a |
+| Mixup α | 0.2 | 0 |
 
 ---
 

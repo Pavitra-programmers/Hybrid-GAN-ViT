@@ -279,14 +279,18 @@ def create_dataloaders(data_dir, batch_size=32, img_size=224, num_workers=0,
         shuffle_train = True
 
     pin = torch.cuda.is_available()
+    pw  = num_workers > 0   # persistent_workers requires num_workers > 0
+    pf  = 2 if num_workers > 0 else None
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size,
         sampler=sampler, shuffle=shuffle_train,
-        num_workers=num_workers, pin_memory=pin
+        num_workers=num_workers, pin_memory=pin,
+        persistent_workers=pw, prefetch_factor=pf,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin
+        num_workers=num_workers, pin_memory=pin,
+        persistent_workers=pw, prefetch_factor=pf,
     )
 
     return train_loader, val_loader

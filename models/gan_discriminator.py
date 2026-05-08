@@ -1,3 +1,4 @@
+import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,10 +55,16 @@ class GANDiscriminator(nn.Module):
             features: Extracted features (batch_size, feature_dim) for fusion with ViT
             classification: Binary classification output (batch_size, 1)
         """
-        # Extract spatial features via pretrained EfficientNet backbone
-        spatial_features = self.backbone_features(x)        # (B, 1792, H', W')
-        pooled = self.backbone_pool(spatial_features)        # (B, 1792, 1, 1)
-        pooled = pooled.view(pooled.size(0), -1)             # (B, 1792)
+        # Run frozen backbone under no_grad to save memory and speed up forward pass
+        _frozen = not next(self.backbone_features.parameters()).requires_grad
+        _ctx = torch.no_grad() if _frozen else contextlib.nullcontext()
+        with _ctx:
+            spatial_features = self.backbone_features(x)    # (B, 1792, H', W')
+            pooled = self.backbone_pool(spatial_features)    # (B, 1792, 1, 1)
+            pooled = pooled.view(pooled.size(0), -1)         # (B, 1792)
+
+        # Cast to float32 — prevents float16 overflow in the 1792-dim Linear projection
+        pooled = pooled.float()
 
         # Project to feature_dim
         features = self.feature_extractor(pooled)            # (B, feature_dim)
